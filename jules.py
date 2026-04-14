@@ -153,6 +153,13 @@ def extract_review(session: dict) -> str:
     return "\n\n".join(parts) if parts else "(no output extracted — session may have made no changes)"
 
 
+def post_to_discord(webhook_url: str, text: str) -> None:
+    """Post review results to a Discord webhook."""
+    chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+    for chunk in chunks:
+        requests.post(webhook_url, json={"content": chunk})
+
+
 def review(repo: str, prompt: str = DEFAULT_REVIEW_PROMPT, branch: str = "main") -> str:
     """Full review flow. Returns the review text."""
     print(f"[jules] submitting review for {repo} @ {branch}...", file=sys.stderr)
@@ -169,6 +176,7 @@ if __name__ == "__main__":
     parser.add_argument("--repo", help="GitHub repo name (e.g. ibkr-terminal). Autodetected from git if omitted.")
     parser.add_argument("--branch", default="main", help="Branch to review")
     parser.add_argument("--prompt", default=DEFAULT_REVIEW_PROMPT, help="Review prompt")
+    parser.add_argument("--discord-channel", help="Discord webhook URL to post results to")
     args = parser.parse_args()
 
     repo = args.repo or infer_repo_from_git()
@@ -177,4 +185,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     result = review(repo, args.prompt, args.branch)
+    if args.discord_channel:
+        post_to_discord(args.discord_channel, result)
     print(result)
