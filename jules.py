@@ -31,7 +31,7 @@ if not GITHUB_USER:
 BASE_URL      = "https://jules.googleapis.com/v1alpha"
 HEADERS       = {"X-Goog-Api-Key": JULES_API_KEY, "Content-Type": "application/json"}
 POLL_INTERVAL = 8    # seconds between state polls
-POLL_TIMEOUT  = 600  # 10 min max wait
+POLL_TIMEOUT  = 3600  # 60 min max wait
 
 DEFAULT_REVIEW_PROMPT = (
     "Review this codebase for: (1) bugs or logic errors, (2) security vulnerabilities, "
