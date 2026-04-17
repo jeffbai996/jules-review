@@ -1,6 +1,10 @@
 certifi==2026.2.25
 charset-normalizer==3.4.7
 idna==3.11
+iniconfig==2.3.0
+packaging==26.1
+pluggy==1.6.0
+pytest==8.3.4
 python-dotenv==1.2.2
 requests==2.33.1
 urllib3==2.6.3
