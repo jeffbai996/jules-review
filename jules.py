@@ -27,9 +27,10 @@ if not JULES_API_KEY:
 GITHUB_USER = os.getenv("JULES_GITHUB_USER")
 if not GITHUB_USER:
     raise RuntimeError("JULES_GITHUB_USER not set in .env or environment")
-BASE_URL     = "https://jules.googleapis.com/v1alpha"
-HEADERS      = {"X-Goog-Api-Key": JULES_API_KEY, "Content-Type": "application/json"}
-POLL_INTERVAL = 8   # seconds between activity polls
+
+BASE_URL      = "https://jules.googleapis.com/v1alpha"
+HEADERS       = {"X-Goog-Api-Key": JULES_API_KEY, "Content-Type": "application/json"}
+POLL_INTERVAL = 8    # seconds between state polls
 POLL_TIMEOUT  = 600  # 10 min max wait
 
 DEFAULT_REVIEW_PROMPT = (
@@ -42,9 +43,12 @@ logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger(__name__)
 
 
-def get_source_name(repo: str) -> str:
-    """Return the Jules source path for a repo."""
-    return f"sources/github/{GITHUB_USER}/{repo}"
+def _raise_for_status(resp: requests.Response) -> None:
+    """raise_for_status but include the response body in the error message."""
+    if not resp.ok:
+        raise requests.HTTPError(
+            f"{resp.status_code} {resp.reason}: {resp.text}", response=resp
+        )
 
 
 def infer_repo_from_git() -> str | None:
@@ -52,12 +56,12 @@ def infer_repo_from_git() -> str | None:
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True,
         )
-        url = result.stdout.strip()
+        url = result.stdout.strip().rstrip("/")
         # Handle both SSH (git@github.com:user/repo.git) and HTTPS
-        repo = url.rstrip("/").rstrip(".git").split("/")[-1]
-        return repo
+        name = url.split("/")[-1].removesuffix(".git")
+        return name
     except Exception:
         return None
 
@@ -67,40 +71,38 @@ def create_session(repo: str, prompt: str, branch: str = "main") -> str:
     payload = {
         "prompt": prompt,
         "sourceContext": {
-            "source": get_source_name(repo),
+            "source": f"sources/github/{GITHUB_USER}/{repo}",
             "githubRepoContext": {"startingBranch": branch},
         },
         "title": f"Review: {repo}",
         # Read-only review — don't auto-create a PR
     }
     resp = requests.post(f"{BASE_URL}/sessions", headers=HEADERS, json=payload)
-    resp.raise_for_status()
-    session = resp.json()
-    session_id = session["name"].split("/")[-1]
+    _raise_for_status(resp)
+    session_id = resp.json()["name"].split("/")[-1]
     log.info("Session created: %s", session_id)
     return session_id
 
 
 def poll_until_done(session_id: str) -> dict:
-    """Poll session until state=COMPLETED. Returns the final session object + activities."""
+    """Poll session until state=COMPLETED. Returns final session object with activities."""
     deadline = time.time() + POLL_TIMEOUT
-    elapsed = 0
+    start = time.time()
 
     while time.time() < deadline:
-        # Check session state
         resp = requests.get(f"{BASE_URL}/sessions/{session_id}", headers=HEADERS)
-        resp.raise_for_status()
+        _raise_for_status(resp)
         session = resp.json()
         state = session.get("state", "")
 
+        elapsed = int(time.time() - start)
         print(f"[jules] {elapsed}s — state={state}", file=sys.stderr)
 
         if state == "COMPLETED":
-            # Fetch activities now that we're done
             acts_resp = requests.get(
                 f"{BASE_URL}/sessions/{session_id}/activities", headers=HEADERS
             )
-            acts_resp.raise_for_status()
+            _raise_for_status(acts_resp)
             session["activities"] = acts_resp.json().get("activities", [])
             return session
 
@@ -108,7 +110,6 @@ def poll_until_done(session_id: str) -> dict:
             raise RuntimeError(f"Jules session failed: {session}")
 
         time.sleep(POLL_INTERVAL)
-        elapsed += POLL_INTERVAL
 
     raise TimeoutError(f"Jules session {session_id} did not complete within {POLL_TIMEOUT}s")
 
@@ -127,16 +128,13 @@ def extract_review(session: dict) -> str:
     commit_message = None
 
     for act in session.get("activities", []):
-        # Collect progress descriptions
         pu = act.get("progressUpdated", {})
         if pu.get("description"):
             progress_notes.append(pu["description"])
 
-        # Find the final patch in sessionCompleted activity
         if "sessionCompleted" in act:
             for artifact in act.get("artifacts", []):
-                cs = artifact.get("changeSet", {})
-                gp = cs.get("gitPatch", {})
+                gp = artifact.get("changeSet", {}).get("gitPatch", {})
                 if gp.get("unidiffPatch"):
                     final_diff = gp["unidiffPatch"]
                 if gp.get("suggestedCommitMessage"):
@@ -154,10 +152,11 @@ def extract_review(session: dict) -> str:
 
 
 def post_to_discord(webhook_url: str, text: str) -> None:
-    """Post review results to a Discord webhook."""
+    """Post review results to a Discord webhook, chunked at 2000 chars."""
     chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
     for chunk in chunks:
-        requests.post(webhook_url, json={"content": chunk})
+        resp = requests.post(webhook_url, json={"content": chunk})
+        _raise_for_status(resp)
 
 
 def review(repo: str, prompt: str = DEFAULT_REVIEW_PROMPT, branch: str = "main") -> str:
