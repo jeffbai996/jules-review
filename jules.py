@@ -39,6 +39,30 @@ DEFAULT_REVIEW_PROMPT = (
     "Be direct and specific — flag line numbers where relevant. Skip praise."
 )
 
+PRESETS = {
+    "security": (
+        "Review this codebase strictly for security vulnerabilities: injection, "
+        "auth bypasses, secret exposure, unsafe deserialization, SSRF, unsafe "
+        "subprocess invocation, dependency CVEs. Skip everything else. Cite "
+        "line numbers."
+    ),
+    "perf": (
+        "Review this codebase strictly for performance issues: N+1 queries, "
+        "unbounded loops, blocking I/O in hot paths, memory leaks, inefficient "
+        "algorithms, excessive allocations. Skip everything else. Cite line numbers."
+    ),
+    "bugs": (
+        "Review this codebase strictly for bugs and logic errors. Skip style, "
+        "skip security, skip performance unless it causes incorrectness. Cite "
+        "line numbers."
+    ),
+    "docs": (
+        "Review this codebase's documentation: missing docstrings on public "
+        "functions, outdated README claims, misleading comments, missing type "
+        "hints. Do not change code logic."
+    ),
+}
+
 logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger(__name__)
 
@@ -82,6 +106,11 @@ def create_session(repo: str, prompt: str, branch: str = "main") -> str:
     session_id = resp.json()["name"].split("/")[-1]
     log.info("Session created: %s", session_id)
     return session_id
+
+
+def submit(repo: str, prompt: str = DEFAULT_REVIEW_PROMPT, branch: str = "main") -> str:
+    """Submit a Jules session and return the session ID immediately. Does not poll."""
+    return create_session(repo, prompt, branch)
 
 
 def poll_until_done(session_id: str) -> dict:
@@ -151,6 +180,36 @@ def extract_review(session: dict) -> str:
     return "\n\n".join(parts) if parts else "(no output extracted — session may have made no changes)"
 
 
+def _extract_diff(session: dict) -> str | None:
+    """Pull the unified diff from a completed Jules session. Returns None if no patch."""
+    for act in session.get("activities", []):
+        if "sessionCompleted" in act:
+            for artifact in act.get("artifacts", []):
+                gp = artifact.get("changeSet", {}).get("gitPatch", {})
+                if gp.get("unidiffPatch"):
+                    return gp["unidiffPatch"]
+    return None
+
+
+def _apply_diff(diff_text: str) -> None:
+    """Pipe diff through `git apply` in CWD. Raises RuntimeError on failure."""
+    result = subprocess.run(
+        ["git", "apply"], input=diff_text, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git apply failed: {result.stderr}")
+
+
+def _fetch_session(session_id: str) -> dict:
+    """Poll + return the raw session dict (used by callers that need the unformatted data)."""
+    return poll_until_done(session_id)
+
+
+def fetch(session_id: str) -> str:
+    """Poll an existing session until COMPLETED, then return formatted review text."""
+    return extract_review(_fetch_session(session_id))
+
+
 def post_to_discord(webhook_url: str, text: str) -> None:
     """Post review results to a Discord webhook, chunked at 2000 chars."""
     chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
@@ -160,30 +219,105 @@ def post_to_discord(webhook_url: str, text: str) -> None:
 
 
 def review(repo: str, prompt: str = DEFAULT_REVIEW_PROMPT, branch: str = "main") -> str:
-    """Full review flow. Returns the review text."""
+    """Full review flow. Returns the review text. Equivalent to fetch(submit(...))."""
     print(f"[jules] submitting review for {repo} @ {branch}...", file=sys.stderr)
-    session_id = create_session(repo, prompt, branch)
+    session_id = submit(repo, prompt, branch)
     print(f"[jules] session {session_id} — polling (may take several minutes)...", file=sys.stderr)
-    session = poll_until_done(session_id)
-    acts = session.get("activities", [])
-    print(f"[jules] done ({len(acts)} activities)", file=sys.stderr)
-    return extract_review(session)
+    return fetch(session_id)
 
 
-if __name__ == "__main__":
+def _resolve_prompt(args) -> str:
+    if args.prompt:
+        return args.prompt
+    if args.preset:
+        return PRESETS[args.preset]
+    return DEFAULT_REVIEW_PROMPT
+
+
+def _print_diff(diff: str) -> None:
+    if not diff:
+        return
+    if diff.endswith("\n"):
+        print(diff, end="")
+    else:
+        print(diff)
+
+
+def _handle_session_output(session: dict, args) -> int:
+    """Apply/format/markdown dispatch for a completed session. Returns exit code."""
+    if args.apply:
+        diff = _extract_diff(session)
+        if not diff:
+            print("ERROR: Jules returned no diff to apply", file=sys.stderr)
+            return 1
+        try:
+            _apply_diff(diff)
+        except RuntimeError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 1
+
+    if args.format == "diff":
+        diff = _extract_diff(session) or ""
+        _print_diff(diff)
+        if args.discord_channel:
+            post_to_discord(args.discord_channel, diff)
+        return 0
+
+    result = extract_review(session)
+    if args.discord_channel:
+        post_to_discord(args.discord_channel, result)
+    print(result)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. Returns exit code."""
     parser = argparse.ArgumentParser(description="Jules code review")
     parser.add_argument("--repo", help="GitHub repo name (e.g. ibkr-terminal). Autodetected from git if omitted.")
     parser.add_argument("--branch", default="main", help="Branch to review")
-    parser.add_argument("--prompt", default=DEFAULT_REVIEW_PROMPT, help="Review prompt")
+    parser.add_argument("--prompt", default=None, help="Review prompt (overrides default and --preset)")
+    parser.add_argument("--preset", choices=list(PRESETS.keys()), help="Canned review prompt (mutually exclusive with --prompt)")
     parser.add_argument("--discord-channel", help="Discord webhook URL to post results to")
-    args = parser.parse_args()
+    parser.add_argument("--submit", action="store_true", help="Submit session and print ID without polling")
+    parser.add_argument("--fetch", metavar="SESSION_ID", help="Poll and return review for an already-submitted session ID")
+    parser.add_argument("--format", choices=["markdown", "diff"], default="markdown", help="Output format (default: markdown)")
+    parser.add_argument("--apply", action="store_true", help="Pipe returned diff through `git apply` in CWD")
+    args = parser.parse_args(argv)
+
+    if args.preset and args.prompt:
+        parser.error("--preset and --prompt are mutually exclusive")
+
+    if args.submit and args.apply:
+        parser.error("--submit and --apply are mutually exclusive (nothing to apply yet)")
+
+    if args.fetch and (args.repo or args.prompt or args.preset or args.submit):
+        parser.error("--fetch cannot be combined with --repo, --prompt, --preset, or --submit")
+
+    if args.fetch:
+        session = _fetch_session(args.fetch)
+        return _handle_session_output(session, args)
+
+    if args.submit:
+        repo = args.repo or infer_repo_from_git()
+        if not repo:
+            print("ERROR: --repo required (or run from a git repo directory)", file=sys.stderr)
+            return 1
+        session_id = submit(repo, _resolve_prompt(args), args.branch)
+        print(session_id)
+        return 0
 
     repo = args.repo or infer_repo_from_git()
     if not repo:
         print("ERROR: --repo required (or run from a git repo directory)", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
-    result = review(repo, args.prompt, args.branch)
-    if args.discord_channel:
-        post_to_discord(args.discord_channel, result)
-    print(result)
+    prompt = _resolve_prompt(args)
+    print(f"[jules] submitting review for {repo} @ {args.branch}...", file=sys.stderr)
+    session_id = submit(repo, prompt, args.branch)
+    print(f"[jules] session {session_id} — polling (may take several minutes)...", file=sys.stderr)
+    session = _fetch_session(session_id)
+    return _handle_session_output(session, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
