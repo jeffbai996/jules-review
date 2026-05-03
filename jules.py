@@ -114,7 +114,16 @@ def submit(repo: str, prompt: str = DEFAULT_REVIEW_PROMPT, branch: str = "main")
 
 
 def poll_until_done(session_id: str) -> dict:
-    """Poll session until state=COMPLETED. Returns final session object with activities."""
+    """Poll session until terminal state. Returns final session object with activities.
+
+    Terminal states:
+    - COMPLETED: agent finished cleanly.
+    - AWAITING_USER_FEEDBACK + artifacts present: review-style sessions end here
+      after producing patches (the "feedback" Jules wants is "apply or iterate?",
+      not a clarifying question). We accept this as done if there's a gitPatch
+      to extract.
+    - FAILED: surfaces as RuntimeError.
+    """
     deadline = time.time() + POLL_TIMEOUT
     start = time.time()
 
@@ -127,13 +136,30 @@ def poll_until_done(session_id: str) -> dict:
         elapsed = int(time.time() - start)
         print(f"[jules] {elapsed}s — state={state}", file=sys.stderr)
 
-        if state == "COMPLETED":
+        if state in ("COMPLETED", "AWAITING_USER_FEEDBACK"):
             acts_resp = requests.get(
-                f"{BASE_URL}/sessions/{session_id}/activities", headers=HEADERS
+                f"{BASE_URL}/sessions/{session_id}/activities?pageSize=100",
+                headers=HEADERS,
             )
             _raise_for_status(acts_resp)
-            session["activities"] = acts_resp.json().get("activities", [])
-            return session
+            activities = acts_resp.json().get("activities", [])
+            session["activities"] = activities
+
+            if state == "COMPLETED":
+                return session
+
+            # AWAITING_USER_FEEDBACK: only terminal if artifacts exist.
+            if any(
+                art.get("changeSet", {}).get("gitPatch", {}).get("unidiffPatch")
+                for act in activities
+                for art in act.get("artifacts", []) or []
+            ):
+                print(
+                    f"[jules] terminal: state=AWAITING_USER_FEEDBACK with artifacts",
+                    file=sys.stderr,
+                )
+                return session
+            # else: keep polling — agent might still be working
 
         if state == "FAILED":
             raise RuntimeError(f"Jules session failed: {session}")
@@ -156,18 +182,20 @@ def extract_review(session: dict) -> str:
     final_diff = None
     commit_message = None
 
+    # Walk ALL activities — gitPatch artifacts can appear on progressUpdated turns
+    # too, especially when the session ends in AWAITING_USER_FEEDBACK rather than
+    # COMPLETED. Activities are time-ordered, so the last patch wins.
     for act in session.get("activities", []):
         pu = act.get("progressUpdated", {})
         if pu.get("description"):
             progress_notes.append(pu["description"])
 
-        if "sessionCompleted" in act:
-            for artifact in act.get("artifacts", []):
-                gp = artifact.get("changeSet", {}).get("gitPatch", {})
-                if gp.get("unidiffPatch"):
-                    final_diff = gp["unidiffPatch"]
-                if gp.get("suggestedCommitMessage"):
-                    commit_message = gp["suggestedCommitMessage"]
+        for artifact in act.get("artifacts", []) or []:
+            gp = artifact.get("changeSet", {}).get("gitPatch", {})
+            if gp.get("unidiffPatch"):
+                final_diff = gp["unidiffPatch"]
+            if gp.get("suggestedCommitMessage"):
+                commit_message = gp["suggestedCommitMessage"]
 
     parts = []
     if commit_message:
@@ -181,14 +209,19 @@ def extract_review(session: dict) -> str:
 
 
 def _extract_diff(session: dict) -> str | None:
-    """Pull the unified diff from a completed Jules session. Returns None if no patch."""
+    """Pull the unified diff from a Jules session. Returns None if no patch.
+
+    Walks ALL activities (not just sessionCompleted) since review-style sessions
+    often end at AWAITING_USER_FEEDBACK with the patch on a progressUpdated turn.
+    Activities are time-ordered; last patch wins.
+    """
+    final = None
     for act in session.get("activities", []):
-        if "sessionCompleted" in act:
-            for artifact in act.get("artifacts", []):
-                gp = artifact.get("changeSet", {}).get("gitPatch", {})
-                if gp.get("unidiffPatch"):
-                    return gp["unidiffPatch"]
-    return None
+        for artifact in act.get("artifacts", []) or []:
+            gp = artifact.get("changeSet", {}).get("gitPatch", {})
+            if gp.get("unidiffPatch"):
+                final = gp["unidiffPatch"]
+    return final
 
 
 def _apply_diff(diff_text: str) -> None:
