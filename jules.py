@@ -20,18 +20,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-JULES_API_KEY = os.getenv("JULES_API_KEY")
-if not JULES_API_KEY:
-    raise RuntimeError("JULES_API_KEY not set in .env or environment")
-
-GITHUB_USER = os.getenv("JULES_GITHUB_USER")
-if not GITHUB_USER:
-    raise RuntimeError("JULES_GITHUB_USER not set in .env or environment")
-
 BASE_URL      = "https://jules.googleapis.com/v1alpha"
-HEADERS       = {"X-Goog-Api-Key": JULES_API_KEY, "Content-Type": "application/json"}
 POLL_INTERVAL = 8    # seconds between state polls
 POLL_TIMEOUT  = 3600  # 60 min max wait
+ACTIVITIES_PAGE_SIZE = 100
 
 DEFAULT_REVIEW_PROMPT = (
     "Review this codebase for: (1) bugs or logic errors, (2) security vulnerabilities, "
@@ -67,6 +59,21 @@ logging.basicConfig(level=logging.WARNING)
 log = logging.getLogger(__name__)
 
 
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} not set in .env or environment")
+    return value
+
+
+def _headers() -> dict[str, str]:
+    """Build API headers lazily so local help/imports do not need credentials."""
+    return {
+        "X-Goog-Api-Key": _required_env("JULES_API_KEY"),
+        "Content-Type": "application/json",
+    }
+
+
 def _raise_for_status(resp: requests.Response) -> None:
     """raise_for_status but include the response body in the error message."""
     if not resp.ok:
@@ -92,16 +99,17 @@ def infer_repo_from_git() -> str | None:
 
 def create_session(repo: str, prompt: str, branch: str = "main") -> str:
     """Submit a Jules session. Returns session ID."""
+    github_user = _required_env("JULES_GITHUB_USER")
     payload = {
         "prompt": prompt,
         "sourceContext": {
-            "source": f"sources/github/{GITHUB_USER}/{repo}",
+            "source": f"sources/github/{github_user}/{repo}",
             "githubRepoContext": {"startingBranch": branch},
         },
         "title": f"Review: {repo}",
         # Read-only review — don't auto-create a PR
     }
-    resp = requests.post(f"{BASE_URL}/sessions", headers=HEADERS, json=payload)
+    resp = requests.post(f"{BASE_URL}/sessions", headers=_headers(), json=payload)
     _raise_for_status(resp)
     session_id = resp.json()["name"].split("/")[-1]
     log.info("Session created: %s", session_id)
@@ -113,22 +121,43 @@ def submit(repo: str, prompt: str = DEFAULT_REVIEW_PROMPT, branch: str = "main")
     return create_session(repo, prompt, branch)
 
 
+def _list_activities(session_id: str) -> list[dict]:
+    """Fetch every activities page for a session in API order."""
+    activities = []
+    page_token = None
+
+    while True:
+        params = {"pageSize": ACTIVITIES_PAGE_SIZE}
+        if page_token:
+            params["pageToken"] = page_token
+        resp = requests.get(
+            f"{BASE_URL}/sessions/{session_id}/activities",
+            headers=_headers(),
+            params=params,
+        )
+        _raise_for_status(resp)
+        page = resp.json()
+        activities.extend(page.get("activities", []))
+
+        page_token = page.get("nextPageToken")
+        if not page_token:
+            return activities
+
+
 def poll_until_done(session_id: str) -> dict:
     """Poll session until terminal state. Returns final session object with activities.
 
     Terminal states:
     - COMPLETED: agent finished cleanly.
-    - AWAITING_USER_FEEDBACK + artifacts present: review-style sessions end here
-      after producing patches (the "feedback" Jules wants is "apply or iterate?",
-      not a clarifying question). We accept this as done if there's a gitPatch
-      to extract.
+    - AWAITING_USER_FEEDBACK: return immediately with activities so callers can
+      surface produced patches or the feedback needed from Jules.
     - FAILED: surfaces as RuntimeError.
     """
     deadline = time.time() + POLL_TIMEOUT
     start = time.time()
 
     while time.time() < deadline:
-        resp = requests.get(f"{BASE_URL}/sessions/{session_id}", headers=HEADERS)
+        resp = requests.get(f"{BASE_URL}/sessions/{session_id}", headers=_headers())
         _raise_for_status(resp)
         session = resp.json()
         state = session.get("state", "")
@@ -137,29 +166,13 @@ def poll_until_done(session_id: str) -> dict:
         print(f"[jules] {elapsed}s — state={state}", file=sys.stderr)
 
         if state in ("COMPLETED", "AWAITING_USER_FEEDBACK"):
-            acts_resp = requests.get(
-                f"{BASE_URL}/sessions/{session_id}/activities?pageSize=100",
-                headers=HEADERS,
-            )
-            _raise_for_status(acts_resp)
-            activities = acts_resp.json().get("activities", [])
-            session["activities"] = activities
-
-            if state == "COMPLETED":
-                return session
-
-            # AWAITING_USER_FEEDBACK: only terminal if artifacts exist.
-            if any(
-                art.get("changeSet", {}).get("gitPatch", {}).get("unidiffPatch")
-                for act in activities
-                for art in act.get("artifacts", []) or []
-            ):
+            session["activities"] = _list_activities(session_id)
+            if state == "AWAITING_USER_FEEDBACK":
                 print(
-                    f"[jules] terminal: state=AWAITING_USER_FEEDBACK with artifacts",
+                    "[jules] terminal: state=AWAITING_USER_FEEDBACK",
                     file=sys.stderr,
                 )
-                return session
-            # else: keep polling — agent might still be working
+            return session
 
         if state == "FAILED":
             raise RuntimeError(f"Jules session failed: {session}")

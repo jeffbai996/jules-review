@@ -38,6 +38,51 @@ def test_fetch_polls_until_completed(fake_response, completed_session_with_diff)
     assert "x = 2" in result
 
 
+def test_fetch_returns_awaiting_feedback_without_patch(fake_response):
+    """A session waiting on feedback must not keep polling until timeout."""
+    awaiting_session = {"name": "sessions/abc123", "state": "AWAITING_USER_FEEDBACK"}
+    activities_response = {
+        "activities": [
+            {"progressUpdated": {"description": "Need a narrower review scope"}},
+        ]
+    }
+
+    with patch(
+        "jules.requests.get",
+        side_effect=[
+            fake_response(awaiting_session),
+            fake_response(activities_response),
+        ],
+    ) as mock_get, patch("jules.time.sleep") as mock_sleep:
+        result = jules.fetch("abc123")
+
+    assert "Need a narrower review scope" in result
+    assert mock_get.call_count == 2
+    mock_sleep.assert_not_called()
+
+
+def test_fetch_reads_all_activity_pages(fake_response, completed_session_with_diff):
+    """The final patch may live after the first activities page."""
+    final_activities = completed_session_with_diff["activities"]
+    responses = [
+        fake_response({"name": "sessions/abc123", "state": "COMPLETED"}),
+        fake_response(
+            {
+                "activities": [{"progressUpdated": {"description": "First page"}}],
+                "nextPageToken": "page-2",
+            }
+        ),
+        fake_response({"activities": final_activities}),
+    ]
+
+    with patch("jules.requests.get", side_effect=responses) as mock_get:
+        result = jules.fetch("abc123")
+
+    assert "First page" in result
+    assert "fix: bump x" in result
+    assert mock_get.call_args_list[-1].kwargs["params"]["pageToken"] == "page-2"
+
+
 def test_review_is_submit_plus_fetch(fake_response, completed_session_with_diff):
     """review() output must be identical to fetch(submit()). Zero regression."""
     post_response = fake_response({"name": "sessions/abc123"})
@@ -132,6 +177,18 @@ def test_main_submit_prints_session_id(fake_response, capsys):
     captured = capsys.readouterr()
     assert captured.out.strip() == "abc123"
     mock_get.assert_not_called()
+
+
+def test_main_help_does_not_require_credentials(monkeypatch, capsys):
+    """CLI help should be available before API credentials are configured."""
+    monkeypatch.delenv("JULES_API_KEY", raising=False)
+    monkeypatch.delenv("JULES_GITHUB_USER", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        jules.main(["--help"])
+
+    assert exc.value.code == 0
+    assert "Jules code review" in capsys.readouterr().out
 
 
 def test_main_fetch_prints_review(fake_response, completed_session_with_diff, capsys):
