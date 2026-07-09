@@ -251,6 +251,23 @@ def _fetch_session(session_id: str) -> dict:
     return poll_until_done(session_id)
 
 
+def peek_session(session_id: str) -> dict:
+    """Single non-blocking state check — one GET, no polling. Returns the raw
+    session dict; when the session is terminal (COMPLETED / AWAITING_USER_FEEDBACK)
+    it also carries `activities` (so callers can pull the diff). Used by a
+    decoupled collect pass that must never block up to the poll timeout.
+
+    Non-terminal sessions come back with whatever `state` the API reports and
+    no activities — the caller leaves them queued and peeks again next pass.
+    """
+    resp = requests.get(f"{BASE_URL}/sessions/{session_id}", headers=_headers())
+    _raise_for_status(resp)
+    session = resp.json()
+    if session.get("state", "") in ("COMPLETED", "AWAITING_USER_FEEDBACK"):
+        session["activities"] = _list_activities(session_id)
+    return session
+
+
 def fetch(session_id: str) -> str:
     """Poll an existing session until COMPLETED, then return formatted review text."""
     return extract_review(_fetch_session(session_id))
@@ -326,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--discord-channel", help="Discord webhook URL to post results to")
     parser.add_argument("--submit", action="store_true", help="Submit session and print ID without polling")
     parser.add_argument("--fetch", metavar="SESSION_ID", help="Poll and return review for an already-submitted session ID")
+    parser.add_argument("--peek", metavar="SESSION_ID", help="Non-blocking single state check: emit output if terminal, else exit 2 (not ready)")
     parser.add_argument("--format", choices=["markdown", "diff"], default="markdown", help="Output format (default: markdown)")
     parser.add_argument("--apply", action="store_true", help="Pipe returned diff through `git apply` in CWD")
     args = parser.parse_args(argv)
@@ -339,8 +357,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.fetch and (args.repo or args.prompt or args.preset or args.submit):
         parser.error("--fetch cannot be combined with --repo, --prompt, --preset, or --submit")
 
+    if args.peek and (args.repo or args.prompt or args.preset or args.submit or args.fetch):
+        parser.error("--peek cannot be combined with --repo, --prompt, --preset, --submit, or --fetch")
+
     if args.fetch:
         session = _fetch_session(args.fetch)
+        return _handle_session_output(session, args)
+
+    if args.peek:
+        session = peek_session(args.peek)
+        state = session.get("state", "")
+        if state not in ("COMPLETED", "AWAITING_USER_FEEDBACK"):
+            # Not ready — exit 2 so the collect pass leaves it queued, distinct
+            # from a real failure (exit 1) or a clean terminal result (exit 0).
+            print(f"[jules] session {args.peek} not ready — state={state or 'UNKNOWN'}",
+                  file=sys.stderr)
+            return 2
         return _handle_session_output(session, args)
 
     if args.submit:
