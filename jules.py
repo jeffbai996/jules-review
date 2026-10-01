@@ -10,6 +10,7 @@ Autodetect: if --repo is omitted, reads git remote origin from cwd to infer repo
 Returns review summary to stdout; optionally posts to Discord if --discord-channel is set.
 """
 import os
+import json
 import sys
 import time
 import argparse
@@ -109,7 +110,7 @@ def create_session(repo: str, prompt: str, branch: str = "main") -> str:
         "title": f"Review: {repo}",
         # Read-only review — don't auto-create a PR
     }
-    resp = requests.post(f"{BASE_URL}/sessions", headers=_headers(), json=payload)
+    resp = requests.post(f"{BASE_URL}/sessions", headers=_headers(), json=payload, timeout=30)
     _raise_for_status(resp)
     session_id = resp.json()["name"].split("/")[-1]
     log.info("Session created: %s", session_id)
@@ -134,6 +135,7 @@ def _list_activities(session_id: str) -> list[dict]:
             f"{BASE_URL}/sessions/{session_id}/activities",
             headers=_headers(),
             params=params,
+            timeout=30,
         )
         _raise_for_status(resp)
         page = resp.json()
@@ -157,7 +159,7 @@ def poll_until_done(session_id: str) -> dict:
     start = time.time()
 
     while time.time() < deadline:
-        resp = requests.get(f"{BASE_URL}/sessions/{session_id}", headers=_headers())
+        resp = requests.get(f"{BASE_URL}/sessions/{session_id}", headers=_headers(), timeout=30)
         _raise_for_status(resp)
         session = resp.json()
         state = session.get("state", "")
@@ -199,6 +201,9 @@ def extract_review(session: dict) -> str:
     # too, especially when the session ends in AWAITING_USER_FEEDBACK rather than
     # COMPLETED. Activities are time-ordered, so the last patch wins.
     for act in session.get("activities", []):
+        message = act.get("agentMessaged", {}).get("agentMessage")
+        if message:
+            progress_notes.append(message)
         pu = act.get("progressUpdated", {})
         if pu.get("description"):
             progress_notes.append(pu["description"])
@@ -260,7 +265,7 @@ def peek_session(session_id: str) -> dict:
     Non-terminal sessions come back with whatever `state` the API reports and
     no activities — the caller leaves them queued and peeks again next pass.
     """
-    resp = requests.get(f"{BASE_URL}/sessions/{session_id}", headers=_headers())
+    resp = requests.get(f"{BASE_URL}/sessions/{session_id}", headers=_headers(), timeout=30)
     _raise_for_status(resp)
     session = resp.json()
     if session.get("state", "") in ("COMPLETED", "AWAITING_USER_FEEDBACK"):
@@ -308,6 +313,12 @@ def _print_diff(diff: str) -> None:
 
 def _handle_session_output(session: dict, args) -> int:
     """Apply/format/markdown dispatch for a completed session. Returns exit code."""
+    if args.format == "json":
+        notes = extract_review(session)
+        print(json.dumps({"state": session.get("state", "UNKNOWN"),
+                          "session_id": session.get("name", "").rsplit("/", 1)[-1],
+                          "report": notes, "diff": _extract_diff(session) or ""}))
+        return 0
     if args.apply:
         diff = _extract_diff(session)
         if not diff:
@@ -344,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--submit", action="store_true", help="Submit session and print ID without polling")
     parser.add_argument("--fetch", metavar="SESSION_ID", help="Poll and return review for an already-submitted session ID")
     parser.add_argument("--peek", metavar="SESSION_ID", help="Non-blocking single state check: emit output if terminal, else exit 2 (not ready)")
-    parser.add_argument("--format", choices=["markdown", "diff"], default="markdown", help="Output format (default: markdown)")
+    parser.add_argument("--format", choices=["markdown", "diff", "json"], default="markdown", help="Output format (default: markdown)")
     parser.add_argument("--apply", action="store_true", help="Pipe returned diff through `git apply` in CWD")
     args = parser.parse_args(argv)
 
@@ -367,6 +378,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.peek:
         session = peek_session(args.peek)
         state = session.get("state", "")
+        if args.format == "json":
+            return _handle_session_output(session, args)
+        if state == "FAILED":
+            print(f"[jules] session {args.peek} failed", file=sys.stderr)
+            return 3
         if state not in ("COMPLETED", "AWAITING_USER_FEEDBACK"):
             # Not ready — exit 2 so the collect pass leaves it queued, distinct
             # from a real failure (exit 1) or a clean terminal result (exit 0).
