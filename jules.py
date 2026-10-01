@@ -359,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="Pipe returned diff through `git apply` in CWD")
     args = parser.parse_args(argv)
 
+    if args.format == "json" and (args.apply or args.discord_channel):
+        parser.error("--format json cannot be combined with --apply or --discord-channel")
+
     if args.preset and args.prompt:
         parser.error("--preset and --prompt are mutually exclusive")
 

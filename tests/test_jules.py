@@ -380,3 +380,8 @@ def test_json_retains_report_without_patch(fake_response, capsys):
     result=json.loads(capsys.readouterr().out)
     assert result["diff"] == ""
     assert "race requiring investigation" in result["report"]
+
+
+def test_json_output_rejects_side_effect_flags():
+    with pytest.raises(SystemExit):
+        jules.main(["--peek", "abc", "--format", "json", "--apply"])
