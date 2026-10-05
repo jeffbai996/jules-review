@@ -357,3 +357,31 @@ def test_main_submit_rejects_apply():
     with pytest.raises(SystemExit) as exc:
         jules.main(["--repo", "my-repo", "--submit", "--apply"])
     assert exc.value.code != 0
+
+
+def test_peek_failed_is_not_still_running(fake_response, capsys):
+    with patch("jules.requests.get", return_value=fake_response({"state": "FAILED"})):
+        assert jules.main(["--peek", "abc123", "--format", "diff"]) == 3
+
+
+@pytest.mark.parametrize("state", ["FAILED", "QUEUED", "PAUSED", "AWAITING_PLAN_APPROVAL"])
+def test_peek_json_preserves_state(fake_response, capsys, state):
+    import json
+    with patch("jules.requests.get", return_value=fake_response({"state": state})) as request:
+        assert jules.main(["--peek", "abc123", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == state
+    assert request.call_args.kwargs["timeout"] == 30
+
+
+def test_json_retains_report_without_patch(fake_response, capsys):
+    import json
+    with patch("jules.requests.get", side_effect=[fake_response({"state":"COMPLETED"}), fake_response({"activities":[{"progressUpdated":{"description":"Found a race requiring investigation"}}]})]):
+        assert jules.main(["--peek", "abc", "--format", "json"]) == 0
+    result=json.loads(capsys.readouterr().out)
+    assert result["diff"] == ""
+    assert "race requiring investigation" in result["report"]
+
+
+def test_json_output_rejects_side_effect_flags():
+    with pytest.raises(SystemExit):
+        jules.main(["--peek", "abc", "--format", "json", "--apply"])
