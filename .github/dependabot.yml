@@ -7,7 +7,7 @@ updates:
       day: monday
       time: "06:00"
       timezone: America/Los_Angeles
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
     commit-message:
       prefix: chore
       include: scope
@@ -19,7 +19,7 @@ updates:
     directory: /
     schedule:
       interval: monthly
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 0
     commit-message:
       prefix: chore(ci)
     labels:

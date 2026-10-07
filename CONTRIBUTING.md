@@ -1,6 +1,8 @@
 # Contributing to jules-review
 
-Thanks for considering a contribution.
+This project was retired on October 6, 2026 and is archived. New issues and pull
+requests are no longer accepted. The workflow below is preserved for reference
+when working on a fork.
 
 ## Before you start
 

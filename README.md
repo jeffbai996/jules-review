@@ -1,5 +1,14 @@
 # jules-review
 
+## Retired
+
+This project was retired on October 6, 2026. The repository is archived and
+preserved under the MIT license for reference. It is no longer maintained;
+bug fixes, dependency updates, and new contributions are not planned.
+
+The setup and usage instructions below describe the final implementation.
+Compatibility with the Google Jules service is no longer verified.
+
 Async client for the [Google Jules](https://jules.google.com) code review API. Submit a session, poll until done, get back a git diff.
 
 Jules is a code *fixer*, not a prose reviewer — output is a unified diff + suggested commit message, not analysis paragraphs.
